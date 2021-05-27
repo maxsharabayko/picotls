@@ -16,6 +16,7 @@ inline void SysCleanupNetwork()
 {
     WSACleanup();
 }
+#pragma comment(lib, "Ws2_32.lib")
 #else
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -153,8 +154,13 @@ int do_handshake(int fd, ptls_t *tls, ptls_buffer_t *wbuf, char *rbuf, size_t *r
             return -1;
         wbuf->off = 0;
 
+#if WIN32
+        while ((rret = recv(fd, rbuf, input_len, 0)) == -1 && errno == EINTR)
+            ;
+#else
         while ((rret = read(fd, rbuf, input_len)) == -1 && errno == EINTR)
             ;
+#endif
 
         if (rret < 0) {
             perror("Read from client failed");
@@ -320,16 +326,14 @@ int main(int argc, char *argv[]) {
 
     ptls_context_t c = {
         ptls_openssl_random_bytes,
+        &ptls_get_time,
         ptls_openssl_key_exchanges,
         ptls_openssl_cipher_suites,
-        { 0 }, // certificates are initialized below
+        { certs, 0 },
         NULL,
         NULL,
         &sign_cert.super
     };
-
-    c.certificates.list = certs;
-    c.certificates.count = 0;
 
     ctx = &c;
     hsprop = &h;
