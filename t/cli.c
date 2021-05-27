@@ -20,25 +20,41 @@
  * IN THE SOFTWARE.
  */
 #include <sys/types.h>
+
+#ifdef WIN32
+//#define _WIN32_WINNT  0x0600 //enable
+#include <Ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+typedef int socklen_t;
+void close(int socket) { closesocket(socket); }
+
+#ifdef  _WIN64
+typedef unsigned __int64    ssize_t;
+#else
+typedef _W64 unsigned int   ssize_t;
+#endif
+#else
 #include <netinet/in.h>
 #include <arpa/nameser.h>
 #include <resolv.h>
-
 #include <arpa/inet.h>
+#include <getopt.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <strings.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <getopt.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
-#include <unistd.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/engine.h>
@@ -85,7 +101,17 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
     ptls_buffer_init(&encbuf, "", 0);
     ptls_buffer_init(&ptbuf, "", 0);
 
+#if WIN32
+    u_long nonBlocking = 1;
+    ret = ioctlsocket(sockfd, FIONBIO, &nonBlocking);
+    if (ret != 0) {
+        fprintf(stderr, "ioctlsocket error %d\n", ret);
+        ret = 1;
+        goto Exit;
+    }
+#else
     fcntl(sockfd, F_SETFL, O_NONBLOCK);
+#endif
 
     if (input_file == input_file_is_benchmark) {
         if (!ptls_is_server(tls))
@@ -255,7 +281,11 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
                 if (wbuf.off != 0)
                     (void)write(sockfd, wbuf.base, wbuf.off);
                 ptls_buffer_dispose(&wbuf);
+#if WIN32
+                shutdown(sockfd, SD_BOTH);
+#else
                 shutdown(sockfd, SHUT_WR);
+#endif
             }
             state = IN_SHUTDOWN;
         }
