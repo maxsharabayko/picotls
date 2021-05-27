@@ -131,8 +131,13 @@ int resolve_address(struct sockaddr *sa, socklen_t *salen, const char *host, con
 int write_all(int fd, const uint8_t *data, size_t len) {
     ssize_t wret;
     while (len != 0) {
+#if WIN32
+        while ((wret = send(fd, data, len, 0)) == -1 && errno == EINTR)
+            ;
+#else
         while ((wret = write(fd, data, len)) == -1 && errno == EINTR)
             ;
+#endif
         if (wret <= 0) {
             fprintf(stderr, "Write to %d failed.\n", fd);
             return -1;
@@ -301,12 +306,20 @@ int run_server(struct sockaddr *sa, socklen_t sa_len) {
             int connection;
             if ((connection = accept(fd, NULL, 0)) != -1) {
                 handle_connection(fd, connection);
+#if WIN32
+                closesocket(connection);
+#else
                 close(connection);
+#endif
             }
         }
     }
 
+#if WIN32
+    closesocket(fd);
+#else
     close(fd);
+#endif
     return rv;
 }
 
@@ -330,9 +343,10 @@ int main(int argc, char *argv[]) {
         ptls_openssl_key_exchanges,
         ptls_openssl_cipher_suites,
         { certs, 0 },
-        NULL,
-        NULL,
-        &sign_cert.super
+        NULL, // esni
+        NULL, // on_client_hello
+        NULL, // emit_certificate
+        &sign_cert.super // sign_certificate
     };
 
     ctx = &c;
