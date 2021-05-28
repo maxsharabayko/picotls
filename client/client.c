@@ -58,56 +58,6 @@ void ossl_start(void) {
 #endif
 }
 
-int read_cert(ptls_openssl_verify_certificate_t *verify_certificate) {
-    FILE *fp;
-    X509 *cert;
-
-    if ((fp = fopen(CERT_PATH, "r")) == NULL) {
-        fprintf(stderr, "Failed to open certificate file at %s\n", CERT_PATH);
-        return -1;
-    }
-
-    while((cert = PEM_read_X509(fp, NULL, NULL, NULL)) != NULL) {
-        ptls_iovec_t *dst = ctx->certificates.list + ctx->certificates.count++;
-        dst->len = i2d_X509(cert, &dst->base);
-    }
-
-    fclose(fp);
-    if (ctx->certificates.count == 0) {
-        fprintf(stderr, "Failed to load certificates from file at %s\n", CERT_PATH);
-        return -1;
-    }
-
-    if (ptls_openssl_init_verify_certificate(verify_certificate, NULL) != 0) {
-        fprintf(stderr, "Failed to verify certificate from file at %s\n", CERT_PATH);
-        return -1;
-    }
-    ctx->verify_certificate = &verify_certificate->super;
-    return 0;
-}
-
-int read_pkey(ptls_openssl_sign_certificate_t *sign_certificate) {
-    FILE *fp;
-
-    if ((fp = fopen(PKEY_PATH, "r")) == NULL) {
-        fprintf(stderr, "Failed to open private key file at %s\n", PKEY_PATH);
-        return -1;
-    }
-
-    EVP_PKEY *pkey = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
-    fclose(fp);
-
-    if (pkey == NULL) {
-        fprintf(stderr, "Failed to load private key from file at %s\n", PKEY_PATH);
-        return -1;
-    }
-
-    int rv = ptls_openssl_init_sign_certificate(sign_certificate, pkey);
-    EVP_PKEY_free(pkey);
-    if (rv)
-        fprintf(stderr, "Failed to sign private key from file at %s\n", PKEY_PATH);
-    return rv;
-}
 
 int resolve_address(struct sockaddr *sa, socklen_t *salen, const char *host, const char *port) {
     struct addrinfo hints, *res;
@@ -190,6 +140,46 @@ int do_handshake(int fd, ptls_t *tls, ptls_buffer_t *wbuf, char *rbuf, size_t *r
     return 0;
 }
 
+int handle_decrypted_data(const uint8_t* input, size_t input_size)
+{
+    fprintf(stderr, "Received: %s.\n", input);
+    return 0;
+}
+
+int handle_input(ptls_t* tls, const uint8_t* input, size_t input_size)
+{
+    size_t input_off = 0;
+    ptls_buffer_t plaintextbuf;
+    int ret;
+
+    if (input_size == 0)
+        return 0;
+
+    ptls_buffer_init(&plaintextbuf, "", 0);
+
+    do {
+        size_t consumed = input_size - input_off;
+        ret = ptls_receive(tls, &plaintextbuf, input + input_off, &consumed);
+        input_off += consumed;
+    } while (ret == 0 && input_off < input_size);
+
+    if (ret == 0)
+    {
+        fprintf(stderr, "Decode success. Input size was %d.\n", input_size);
+        *(plaintextbuf.base + plaintextbuf.off) = 0; // terminating null
+        ret = handle_decrypted_data(plaintextbuf.base, plaintextbuf.off);
+    }
+    else
+    {
+        fprintf(stderr, "Decode error: %d. Input size was %d.\n", ret, input_size);
+
+    }
+
+    ptls_buffer_dispose(&plaintextbuf);
+
+    return ret;
+}
+
 int decrypt_and_print(ptls_t *tls, const uint8_t *input, size_t inlen) {
     ptls_buffer_t decryptbuf;
     uint8_t decryptbuf_small[1024];
@@ -219,14 +209,18 @@ exit:
     return ret;
 }
 
-int handle_connection(int server, int client) {
+int handle_connection(int client) {
     int rv = 0;
     char rbuf[1024], wbuf_small[1024];
     ptls_buffer_t wbuf;
-    printf("Connection received\n");
+    printf("Initializing TLS connection\n");
 
-    ptls_t *tls = ptls_new(ctx, 1);
+    // (0: client, 1 : server).
+    ptls_t *tls = ptls_new(ctx, 0);
     ptls_buffer_init(&wbuf, wbuf_small, sizeof(wbuf_small));
+
+    const char* server_name = "127.0.0.1";
+    ptls_set_server_name(tls, server_name, 0);
 
     size_t rbuf_len = sizeof(rbuf);
     if (do_handshake(client, tls, &wbuf, rbuf, &rbuf_len, hsprop, (ptls_iovec_t){ NULL, 0 }) != 0) {
@@ -235,22 +229,24 @@ int handle_connection(int server, int client) {
     }
     wbuf.off = 0;
 
-    if (decrypt_and_print(tls, (const uint8_t*)rbuf, rbuf_len) != 0) {
-        rv = -1;
-        goto exit;
-    }
+    printf("Handshake done.\n");
 
-    // Send a message to the client:
-    if ((rv = ptls_send(tls, &wbuf, "Hello, World!\n", strlen("Hello, World!\n"))) != 0) {
-        fprintf(stderr, "Failed to encrypt message to client: %d\n", rv);
+    /*if (decrypt_and_print(tls, (const uint8_t*)rbuf, rbuf_len) != 0) {
         rv = -1;
         goto exit;
-    }
+    }*/
 
-    if (write_all(client, wbuf.base, wbuf.off) != 0) {
-        rv = -1;
-        goto exit;
-    }
+    // Receive a message from the server
+#if WIN32
+    rbuf_len = sizeof(rbuf);
+    while ((rv = recv(client, rbuf, rbuf_len, 0)) == -1 && errno == EINTR)
+        ;
+#else
+    while ((rv = read(client, rbuf, rbuf_len)) == -1 && errno == EINTR)
+        ;
+#endif
+
+    handle_input(tls, (const uint8_t*)rbuf, rbuf_len);
 
 exit:
     ptls_buffer_dispose(&wbuf);
@@ -258,7 +254,7 @@ exit:
     return rv;
 }
 
-int run_server(struct sockaddr *sa, socklen_t sa_len) {
+int run_client(struct sockaddr *sa, socklen_t sa_len) {
     int fd, on = 1;
 
     if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
@@ -278,51 +274,30 @@ int run_server(struct sockaddr *sa, socklen_t sa_len) {
         perror("setsockopt(SO_REUSEPORT) failed");
         return -1;
 #endif
-    } else if (bind(fd, sa, sa_len) != 0) {
-        perror("bind(2) failed");
-        return -1;
-    } else if (listen(fd, SOMAXCONN) != 0) {
-        perror("listen(2) failed");
+    }
+    
+    if (connect(fd, sa, sa_len) != 0)
+    {
+        perror("connect() failed");
         return -1;
     }
 
-    fd_set active_fd_set;
-    FD_ZERO(&active_fd_set);
-    FD_SET(fd, &active_fd_set);
-    const int maxfd = fd;
+    perror("connected, doing TLS handshake...");
 
-    int rv = 0;
-    while (1) {
-        int sel_rv = select(maxfd + 1, &active_fd_set, NULL, NULL, NULL);
-        if (sel_rv < 0) {
-            if (errno == EINTR)
-                break;
-            else {
-                perror("select failed");
-                rv = -1;
-                break;
-            }
-        }
-
-        if (FD_ISSET(fd, &active_fd_set)) {
-            int connection;
-            if ((connection = accept(fd, NULL, 0)) != -1) {
-                handle_connection(fd, connection);
+  
+    handle_connection(fd);
 #if WIN32
-                closesocket(connection);
+    closesocket(fd);
 #else
-                close(connection);
+    close(fd);
 #endif
-            }
-        }
-    }
 
 #if WIN32
     closesocket(fd);
 #else
     close(fd);
 #endif
-    return rv;
+    return 0;
 }
 
 void signal_handler(int info) {
@@ -336,19 +311,22 @@ int main(int argc, char *argv[]) {
     socklen_t sa_len;
     ptls_iovec_t certs[16] = { { NULL } };
     ptls_openssl_sign_certificate_t sign_cert = { { NULL } };
-    ptls_openssl_verify_certificate_t verify_certificate = { { NULL } };
     ptls_handshake_properties_t h = { { { NULL } } };
+
+    //ptls_openssl_verify_certificate_t verifier;
+    //ptls_openssl_init_verify_certificate(&verifier, NULL);
 
     ptls_context_t c = {
         ptls_openssl_random_bytes,
         &ptls_get_time,
         ptls_openssl_key_exchanges,
         ptls_openssl_cipher_suites,
-        { certs, 0 },
+        { NULL, 0 },
         NULL, // esni
         NULL, // on_client_hello
         NULL, // emit_certificate
-        &sign_cert.super // sign_certificate
+        &sign_cert.super, // sign_certificate
+        NULL //&verifier.super  // verify_certificate
     };
 
     ctx = &c;
@@ -365,13 +343,9 @@ int main(int argc, char *argv[]) {
     SysInitializeNetwork();
 
     if (rv == 0)
-        rv = read_cert(&verify_certificate);
-    if (rv == 0)
-        rv = read_pkey(&sign_cert);
-    if (rv == 0)
         rv = resolve_address((struct sockaddr*)&sa, &sa_len, "127.0.0.1", "8000");
     if (rv == 0)
-        rv = run_server((struct sockaddr*)&sa, sa_len);
+        rv = run_client((struct sockaddr*)&sa, sa_len);
 
     printf("\nProgram exited with code %d.\n", rv);
     SysCleanupNetwork();

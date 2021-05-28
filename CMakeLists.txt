@@ -218,3 +218,4 @@ IF (BUILD_FUZZER)
 ENDIF()
 
 add_subdirectory(server)
+add_subdirectory(client)
